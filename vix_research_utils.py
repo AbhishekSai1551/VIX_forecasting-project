@@ -16,7 +16,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 def download_market_data():
-    """Download VIX and VVIX data"""
+    """Download VIX and VVIX data from Yahoo Finance"""
     tickers = ['^VIX', '^VVIX']
     start_date = '2010-01-01'
     end_date = datetime.now().strftime('%Y-%m-%d')
@@ -27,22 +27,29 @@ def download_market_data():
     vix_data = data['^VIX'].copy()
     vvix_data = data['^VVIX'].copy()
     
+    # Align data by common dates
     common_dates = vix_data.index.intersection(vvix_data.index)
     vix_data = vix_data.loc[common_dates]
     vvix_data = vvix_data.loc[common_dates]
     
     return vix_data, vvix_data
 
-def clean_data(df):
-    """data cleaning"""
+def robust_data_cleaning(df):
+    """Enhanced cleaning with mean imputation, 3-sigma outlier handling, and inf/NaN checks"""
     clean_df = df.copy()
+    
+    # Replace inf with NaN
     clean_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     
+    # Mean imputation for missing values
     for col in clean_df.columns:
         if clean_df[col].isnull().sum() > 0:
             col_mean = clean_df[col].mean()
             clean_df[col] = clean_df[col].fillna(col_mean)
+            print(f"Imputed {clean_df[col].isnull().sum()} missing values in {col} with mean {col_mean:.2f}")
     
+    # 3-sigma outlier detection and treatment
+    outlier_counts = {}
     for col in clean_df.select_dtypes(include=[np.number]).columns:
         z_scores = zscore(clean_df[col].replace([np.inf, -np.inf], np.nan).dropna())
         outliers = np.abs(z_scores) > 3
@@ -50,11 +57,21 @@ def clean_data(df):
             upper_bound = clean_df[col].mean() + 3*clean_df[col].std()
             lower_bound = clean_df[col].mean() - 3*clean_df[col].std()
             clean_df.loc[outliers, col] = np.clip(clean_df.loc[outliers, col], lower_bound, upper_bound)
+            outlier_counts[col] = outliers.sum()
+    
+    if outlier_counts:
+        print("\nOutliers treated:")
+        for col, count in outlier_counts.items():
+            print(f"{col}: {count} outliers winsorized")
+    
+    # Final check for inf/NaN
+    if clean_df.isin([np.inf, -np.inf]).any().any() or clean_df.isnull().any().any():
+        raise ValueError("Data still contains inf/NaN after cleaning")
     
     return clean_df
 
 def create_technical_features(df):
-    """Create technical features"""
+    """Create technical features with safeguards against inf/NaN"""
     enhanced_df = df.copy()
     
     # Moving Averages
@@ -62,33 +79,68 @@ def create_technical_features(df):
         enhanced_df[f'MA_{window}_VIX'] = enhanced_df['Close_VIX'].rolling(window).mean()
         enhanced_df[f'MA_{window}_VVIX'] = enhanced_df['Close_VVIX'].rolling(window).mean()
     
-    # Returns and volatility
+    # Yield Calculations with clipping to avoid extreme values
     enhanced_df['Yield_VIX'] = enhanced_df['Close_VIX'].pct_change() * 100
     enhanced_df['Yield_VIX'] = enhanced_df['Yield_VIX'].clip(-100, 100)
     enhanced_df['Yield_VVIX'] = enhanced_df['Close_VVIX'].pct_change() * 100
     enhanced_df['Yield_VVIX'] = enhanced_df['Yield_VVIX'].clip(-100, 100)
     
+    # Volatility Measures
     enhanced_df['Volatility_VIX'] = enhanced_df['Yield_VIX'].rolling(5).std()
     enhanced_df['Volatility_VVIX'] = enhanced_df['Yield_VVIX'].rolling(5).std()
     
-    # Lagged features
+    # Lagged Features
     for lag in [1, 3, 5]:
         enhanced_df[f'Lag_{lag}_VIX'] = enhanced_df['Close_VIX'].shift(lag)
         enhanced_df[f'Lag_{lag}_VVIX'] = enhanced_df['Close_VVIX'].shift(lag)
     
-    # GARCH volatility
+    # GARCH Conditional Volatility with safeguards
     try:
         returns = np.log((enhanced_df['Close_VIX'] + 1e-6) / (enhanced_df['Close_VIX'].shift(1) + 1e-6)).replace([np.inf, -np.inf], np.nan).dropna()
         garch = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=False)
         garch_fit = garch.fit(disp='off')
         enhanced_df['GARCH_Volatility'] = np.nan
         enhanced_df.loc[garch_fit.conditional_volatility.index, 'GARCH_Volatility'] = garch_fit.conditional_volatility
-        enhanced_df['GARCH_Volatility'] = enhanced_df['GARCH_Volatility'].clip(0, 100)
+        enhanced_df['GARCH_Volatility'] = enhanced_df['GARCH_Volatility'].clip(0, 100)  # Cap volatility
     except:
         enhanced_df['GARCH_Volatility'] = enhanced_df['Volatility_VIX']
     
+    # Drop NAs and check for inf/NaN
     enhanced_df.dropna(inplace=True)
+    if enhanced_df.isin([np.inf, -np.inf]).any().any():
+        raise ValueError("Feature engineering produced inf values")
+    
     return enhanced_df
+
+def prepare_sequences(df, sequence_length=30, target_col='Close_VIX'):
+    """Prepare sequences for deep learning models"""
+    # Separate features and target
+    feature_cols = [col for col in df.columns if col != target_col]
+    features = df[feature_cols].values
+    target = df[target_col].values
+    
+    # Create sequences
+    X, y = [], []
+    for i in range(sequence_length, len(df)):
+        X.append(features[i-sequence_length:i])
+        y.append(target[i])
+    
+    X = np.array(X)
+    y = np.array(y)
+    
+    # Scale features
+    scaler = RobustScaler()
+    X_scaled = scaler.fit_transform(X.reshape(-1, X.shape[-1])).reshape(X.shape)
+    
+    return X_scaled, y, feature_cols, scaler
+
+def create_sequences(data, n_steps=30):
+    """Create sequences for time series modeling (legacy function)"""
+    X, y = [], []
+    for i in range(n_steps, len(data)):
+        X.append(data.iloc[i-n_steps:i, :-1].values)
+        y.append(data.iloc[i, -1])
+    return np.array(X), np.array(y)
 
 def optimize_features(df, target_col='Close_VIX', variance_threshold=0.95):
     """Feature selection with PCA"""
@@ -110,14 +162,6 @@ def optimize_features(df, target_col='Close_VIX', variance_threshold=0.95):
     final_df[target_col] = y
     
     return final_df, pca, scaler, selected_features
-
-def create_sequences(data, n_steps=30):
-    """Create sequences for time series modeling"""
-    X, y = [], []
-    for i in range(n_steps, len(data)):
-        X.append(data.iloc[i-n_steps:i, :-1].values)
-        y.append(data.iloc[i, -1])
-    return np.array(X), np.array(y)
 
 def time_series_split(X, y, n_splits=5):
     """Create time series cross-validation splits"""
@@ -219,5 +263,71 @@ def create_baseline_models(y_train, y_test):
     baselines['Random_Walk'] = rw_pred
     
     return baselines
+
+def fit_duan_garch_model(returns_data):
+    """Implement Duan's GARCH methodology for VIX forecasting"""
+    try:
+        # GARCH(1,1) with Student-t distribution
+        model = arch_model(returns_data, vol='Garch', p=1, q=1, dist='t', rescale=False)
+        fitted_model = model.fit(disp='off')
+        return fitted_model
+    except Exception as e:
+        print(f"GARCH model fitting failed: {e}")
+        return None
+
+def garch_forecast_vix(fitted_model, horizon=1):
+    """Generate VIX forecasts using fitted GARCH model"""
+    if fitted_model is None:
+        return None
+    try:
+        forecast = fitted_model.forecast(horizon=horizon)
+        return forecast
+    except Exception as e:
+        print(f"GARCH forecasting failed: {e}")
+        return None
+
+def create_features(vix_data, vvix_data):
+    """Create combined features from VIX and VVIX data"""
+    # Merge VIX and VVIX data
+    raw_data = pd.merge(vix_data, vvix_data, left_index=True, right_index=True,
+                        suffixes=('_VIX', '_VVIX'))
+    
+    # Clean the data
+    cleaned_data = robust_data_cleaning(raw_data)
+    
+    # Create technical features
+    featured_data = create_technical_features(cleaned_data)
+    
+    return featured_data
+
+def evaluate_model_performance(y_true, y_pred, model_name="Model"):
+    """Comprehensive model performance evaluation"""
+    metrics = calculate_metrics(y_true, y_pred)
+    
+    print(f"\n{model_name} Performance:")
+    print(f"  MSE: {metrics['MSE']:.6f}")
+    print(f"  MAE: {metrics['MAE']:.6f}")
+    print(f"  RMSE: {metrics['RMSE']:.6f}")
+    print(f"  R²: {metrics['R2']:.6f}")
+    print(f"  Directional Accuracy: {metrics['Directional_Accuracy']:.3f}")
+    
+    return metrics
+
+def save_model_results(results, filename):
+    """Save model results to pickle file"""
+    import joblib
+    joblib.dump(results, filename)
+    print(f"Results saved to {filename}")
+
+def load_model_results(filename):
+    """Load model results from pickle file"""
+    import joblib
+    try:
+        results = joblib.load(filename)
+        print(f"Results loaded from {filename}")
+        return results
+    except FileNotFoundError:
+        print(f"File {filename} not found")
+        return None
 
 print("VIX Research Utility Functions loaded successfully!")
